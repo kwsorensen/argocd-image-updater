@@ -6,15 +6,23 @@ package registry
 // TODO: Refactor this package and provide mocks for better testing.
 
 import (
-	"encoding/json"
+	"context"
 	"fmt"
 	"strings"
+	"sync"
 	"time"
 
-	"github.com/argoproj-labs/argocd-image-updater/pkg/client"
+	"github.com/docker/distribution"
+	"golang.org/x/sync/semaphore"
+
 	"github.com/argoproj-labs/argocd-image-updater/pkg/image"
+	"github.com/argoproj-labs/argocd-image-updater/pkg/kube"
 	"github.com/argoproj-labs/argocd-image-updater/pkg/log"
 	"github.com/argoproj-labs/argocd-image-updater/pkg/tag"
+)
+
+const (
+	MaxMetadataConcurrency = 20
 )
 
 // GetTags returns a list of available tags for the given image
@@ -23,11 +31,12 @@ func (endpoint *RegistryEndpoint) GetTags(img *image.ContainerImage, regClient R
 	var imgTag *tag.ImageTag
 	var err error
 
-	// DockerHub has a special namespace 'library', that is hidden from the user
-	// FIXME: How do other registries handle this?
+	// Some registries have a default namespace that is used when the image name
+	// doesn't specify one. For example at Docker Hub, this is 'library'.
 	var nameInRegistry string
-	if len := len(strings.Split(img.ImageName, "/")); len == 1 {
-		nameInRegistry = "library/" + img.ImageName
+	if len := len(strings.Split(img.ImageName, "/")); len == 1 && endpoint.DefaultNS != "" {
+		nameInRegistry = endpoint.DefaultNS + "/" + img.ImageName
+		log.Debugf("Using canonical image name '%s' for image '%s'", nameInRegistry, img.ImageName)
 	} else {
 		nameInRegistry = img.ImageName
 	}
@@ -39,10 +48,10 @@ func (endpoint *RegistryEndpoint) GetTags(img *image.ContainerImage, regClient R
 	tags := []string{}
 
 	// Loop through tags, removing those we do not want
-	if vc.MatchFunc != nil {
+	if vc.MatchFunc != nil || len(vc.IgnoreList) > 0 {
 		for _, t := range tTags {
-			if !vc.MatchFunc(t, vc.MatchArgs) {
-				log.Tracef("Removing tag %s because of tag match options", t)
+			if (vc.MatchFunc != nil && !vc.MatchFunc(t, vc.MatchArgs)) || vc.IsTagIgnored(t) {
+				log.Tracef("Removing tag %s because it either didn't match defined pattern or is ignored", t)
 			} else {
 				tags = append(tags, t)
 			}
@@ -73,10 +82,17 @@ func (endpoint *RegistryEndpoint) GetTags(img *image.ContainerImage, regClient R
 		return tagList, nil
 	}
 
+	sem := semaphore.NewWeighted(int64(MaxMetadataConcurrency))
+	tagListLock := &sync.RWMutex{}
+
+	var wg sync.WaitGroup
+	wg.Add(len(tags))
+
 	// Fetch the manifest for the tag -- we need v1, because it contains history
 	// information that we require.
+	i := 0
 	for _, tagStr := range tags {
-
+		i += 1
 		// Look into the cache first and re-use any found item. If GetTag() returns
 		// an error, we treat it as a cache miss and just go ahead to invalidate
 		// the entry.
@@ -85,57 +101,83 @@ func (endpoint *RegistryEndpoint) GetTags(img *image.ContainerImage, regClient R
 			log.Warnf("invalid entry for %s:%s in cache, invalidating.", nameInRegistry, imgTag.TagName)
 		} else if imgTag != nil {
 			log.Debugf("Cache hit for %s:%s", nameInRegistry, imgTag.TagName)
+			tagListLock.Lock()
 			tagList.Add(imgTag)
+			tagListLock.Unlock()
+			wg.Done()
 			continue
 		}
 
-		ml, err := regClient.ManifestV1(nameInRegistry, tagStr)
-		if err != nil {
-			return nil, err
-		}
+		log.Tracef("Getting manifest for image %s:%s (operation %d/%d)", nameInRegistry, tagStr, i, len(tags))
 
-		if len(ml.History) < 1 {
-			log.Warnf("Could not get creation date for %s: History information missing", img.GetFullNameWithTag())
+		lockErr := sem.Acquire(context.TODO(), 1)
+		if lockErr != nil {
+			log.Warnf("could not acquire semaphore: %v", lockErr)
+			wg.Done()
 			continue
 		}
+		log.Tracef("acquired metadata semaphore")
 
-		var histInfo map[string]interface{}
-		err = json.Unmarshal([]byte(ml.History[0].V1Compatibility), &histInfo)
-		if err != nil {
-			log.Warnf("Could not unmarshal history info for %s: %v", img.GetFullNameWithTag(), err)
-			continue
-		}
+		go func(tagStr string) {
+			defer func() {
+				sem.Release(1)
+				wg.Done()
+				log.Tracef("released semaphore and terminated waitgroup")
+			}()
 
-		crIf, ok := histInfo["created"]
-		if !ok {
-			log.Warnf("Incomplete history information for %s: no creation timestamp found", img.GetFullNameWithTag())
-			continue
-		}
+			var ml distribution.Manifest
+			var err error
 
-		crStr, ok := crIf.(string)
-		if !ok {
-			log.Warnf("Creation timestamp for %s has wrong type - need string, is %T", img.GetFullNameWithTag(), crIf)
-			continue
-		}
+			// We first try to fetch a V2 manifest, and if that's not available we fall
+			// back to fetching V1 manifest. If that fails also, we just skip this tag.
+			if ml, err = regClient.ManifestV2(nameInRegistry, tagStr); err != nil {
+				log.Debugf("No V2 manifest for %s:%s, fetching V1 (%v)", nameInRegistry, tagStr, err)
+				if ml, err = regClient.ManifestV1(nameInRegistry, tagStr); err != nil {
+					log.Errorf("Error fetching metadata for %s:%s - neither V1 or V2 manifest returned by registry: %v", nameInRegistry, tagStr, err)
+					return
+				}
+			}
 
-		// Creation date is stored as RFC3339 timestamp with nanoseconds, i.e. like
-		// this: 2017-12-01T23:06:12.607835588Z
-		log.Tracef("Found origin creation date for %s: %s", tagStr, crStr)
-		crDate, err := time.Parse(time.RFC3339Nano, crStr)
-		if err != nil {
-			log.Warnf("Could not parse creation timestamp for %s (%s): %v", img.GetFullNameWithTag(), crStr, err)
-			continue
-		}
-		imgTag = tag.NewImageTag(tagStr, crDate)
-		tagList.Add(imgTag)
-		endpoint.Cache.SetTag(nameInRegistry, imgTag)
+			// Parse required meta data from the manifest. The metadata contains all
+			// information needed to decide whether to consider this tag or not.
+			ti, err := regClient.TagMetadata(nameInRegistry, ml)
+			if err != nil {
+				log.Errorf("error fetching metadata for %s:%s: %v", nameInRegistry, tagStr, err)
+				return
+			}
+			if ti == nil {
+				log.Debugf("No metadata found for %s:%s", nameInRegistry, tagStr)
+				return
+			}
+
+			log.Tracef("Found date %s", ti.CreatedAt.String())
+
+			imgTag = tag.NewImageTag(tagStr, ti.CreatedAt)
+			tagListLock.Lock()
+			tagList.Add(imgTag)
+			tagListLock.Unlock()
+			endpoint.Cache.SetTag(nameInRegistry, imgTag)
+		}(tagStr)
 	}
 
+	wg.Wait()
 	return tagList, err
 }
 
+func (ep *RegistryEndpoint) expireCredentials() bool {
+	if ep.Credentials != "" && !ep.CredsUpdated.IsZero() && ep.CredsExpire > 0 && time.Since(ep.CredsUpdated) >= ep.CredsExpire {
+		ep.Username = ""
+		ep.Password = ""
+		return true
+	}
+	return false
+}
+
 // Sets endpoint credentials for this registry from a reference to a K8s secret
-func (ep *RegistryEndpoint) SetEndpointCredentials(kubeClient *client.KubernetesClient) error {
+func (ep *RegistryEndpoint) SetEndpointCredentials(kubeClient *kube.KubernetesClient) error {
+	if ep.expireCredentials() {
+		log.Debugf("expired credentials for registry %s (updated:%s, expiry:%0fs)", ep.RegistryAPI, ep.CredsUpdated, ep.CredsExpire.Seconds())
+	}
 	if ep.Username == "" && ep.Password == "" && ep.Credentials != "" {
 		credSrc, err := image.ParseCredentialSource(ep.Credentials, false)
 		if err != nil {
@@ -154,6 +196,8 @@ func (ep *RegistryEndpoint) SetEndpointCredentials(kubeClient *client.Kubernetes
 		if err != nil {
 			return err
 		}
+
+		ep.CredsUpdated = time.Now()
 
 		ep.Username = creds.Username
 		ep.Password = creds.Password

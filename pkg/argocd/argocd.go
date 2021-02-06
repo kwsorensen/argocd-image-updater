@@ -9,12 +9,59 @@ import (
 
 	"github.com/argoproj-labs/argocd-image-updater/pkg/common"
 	"github.com/argoproj-labs/argocd-image-updater/pkg/image"
+	"github.com/argoproj-labs/argocd-image-updater/pkg/kube"
 	"github.com/argoproj-labs/argocd-image-updater/pkg/log"
+	"github.com/argoproj-labs/argocd-image-updater/pkg/metrics"
 
 	argocdclient "github.com/argoproj/argo-cd/pkg/apiclient"
 	"github.com/argoproj/argo-cd/pkg/apiclient/application"
 	"github.com/argoproj/argo-cd/pkg/apis/application/v1alpha1"
+	"k8s.io/apimachinery/pkg/api/errors"
+	v1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 )
+
+// Kubernetes based client
+type k8sClient struct {
+	kubeClient *kube.KubernetesClient
+}
+
+func (client *k8sClient) GetApplication(ctx context.Context, appName string) (*v1alpha1.Application, error) {
+	return client.kubeClient.ApplicationsClientset.ArgoprojV1alpha1().Applications(client.kubeClient.Namespace).Get(ctx, appName, v1.GetOptions{})
+}
+
+func (client *k8sClient) ListApplications() ([]v1alpha1.Application, error) {
+	list, err := client.kubeClient.ApplicationsClientset.ArgoprojV1alpha1().Applications(client.kubeClient.Namespace).List(context.TODO(), v1.ListOptions{})
+	if err != nil {
+		return nil, err
+	}
+	return list.Items, nil
+}
+
+func (client *k8sClient) UpdateSpec(ctx context.Context, spec *application.ApplicationUpdateSpecRequest) (*v1alpha1.ApplicationSpec, error) {
+	for {
+		app, err := client.kubeClient.ApplicationsClientset.ArgoprojV1alpha1().Applications(client.kubeClient.Namespace).Get(ctx, spec.GetName(), v1.GetOptions{})
+		if err != nil {
+			return nil, err
+		}
+		app.Spec = spec.Spec
+
+		updatedApp, err := client.kubeClient.ApplicationsClientset.ArgoprojV1alpha1().Applications(client.kubeClient.Namespace).Update(ctx, app, v1.UpdateOptions{})
+		if err != nil {
+			if errors.IsConflict(err) {
+				continue
+			}
+			return nil, err
+		}
+		return &updatedApp.Spec, nil
+	}
+
+}
+
+// NewAPIClient creates a new API client for ArgoCD and connects to the ArgoCD
+// API server.
+func NewK8SClient(kubeClient *kube.KubernetesClient) (ArgoCD, error) {
+	return &k8sClient{kubeClient: kubeClient}, nil
+}
 
 // Native
 type argoCD struct {
@@ -48,9 +95,9 @@ type ClientOptions struct {
 	AuthToken       string
 }
 
-// NewClient creates a new API client for ArgoCD and connects to the ArgoCD
+// NewAPIClient creates a new API client for ArgoCD and connects to the ArgoCD
 // API server.
-func NewClient(opts *ClientOptions) (ArgoCD, error) {
+func NewAPIClient(opts *ClientOptions) (ArgoCD, error) {
 
 	envAuthToken := os.Getenv("ARGOCD_TOKEN")
 	if envAuthToken != "" && opts.AuthToken == "" {
@@ -143,13 +190,17 @@ func FilterApplicationsForUpdate(apps []v1alpha1.Application, patterns []string)
 // GetApplication gets the application named appName from Argo CD API
 func (client *argoCD) GetApplication(ctx context.Context, appName string) (*v1alpha1.Application, error) {
 	conn, appClient, err := client.Client.NewApplicationClient()
+	metrics.Clients().IncreaseArgoCDClientRequest(client.Client.ClientOptions().ServerAddr, 1)
 	if err != nil {
+		metrics.Clients().IncreaseArgoCDClientError(client.Client.ClientOptions().ServerAddr, 1)
 		return nil, err
 	}
 	defer conn.Close()
 
+	metrics.Clients().IncreaseArgoCDClientRequest(client.Client.ClientOptions().ServerAddr, 1)
 	app, err := appClient.Get(ctx, &application.ApplicationQuery{Name: &appName})
 	if err != nil {
+		metrics.Clients().IncreaseArgoCDClientError(client.Client.ClientOptions().ServerAddr, 1)
 		return nil, err
 	}
 
@@ -160,13 +211,17 @@ func (client *argoCD) GetApplication(ctx context.Context, appName string) (*v1al
 // has access to.
 func (client *argoCD) ListApplications() ([]v1alpha1.Application, error) {
 	conn, appClient, err := client.Client.NewApplicationClient()
+	metrics.Clients().IncreaseArgoCDClientRequest(client.Client.ClientOptions().ServerAddr, 1)
 	if err != nil {
+		metrics.Clients().IncreaseArgoCDClientError(client.Client.ClientOptions().ServerAddr, 1)
 		return nil, err
 	}
 	defer conn.Close()
 
+	metrics.Clients().IncreaseArgoCDClientRequest(client.Client.ClientOptions().ServerAddr, 1)
 	apps, err := appClient.List(context.TODO(), &application.ApplicationQuery{})
 	if err != nil {
+		metrics.Clients().IncreaseArgoCDClientError(client.Client.ClientOptions().ServerAddr, 1)
 		return nil, err
 	}
 
@@ -176,13 +231,17 @@ func (client *argoCD) ListApplications() ([]v1alpha1.Application, error) {
 // UpdateSpec updates the spec for given application
 func (client *argoCD) UpdateSpec(ctx context.Context, in *application.ApplicationUpdateSpecRequest) (*v1alpha1.ApplicationSpec, error) {
 	conn, appClient, err := client.Client.NewApplicationClient()
+	metrics.Clients().IncreaseArgoCDClientRequest(client.Client.ClientOptions().ServerAddr, 1)
 	if err != nil {
+		metrics.Clients().IncreaseArgoCDClientError(client.Client.ClientOptions().ServerAddr, 1)
 		return nil, err
 	}
 	defer conn.Close()
 
+	metrics.Clients().IncreaseArgoCDClientRequest(client.Client.ClientOptions().ServerAddr, 1)
 	spec, err := appClient.UpdateSpec(ctx, in)
 	if err != nil {
+		metrics.Clients().IncreaseArgoCDClientError(client.Client.ClientOptions().ServerAddr, 1)
 		return nil, err
 	}
 
@@ -265,7 +324,7 @@ func mergeHelmParams(src []v1alpha1.HelmParameter, merge []v1alpha1.HelmParamete
 }
 
 // SetHelmImage sets image parameters for a Helm application
-func SetHelmImage(client ArgoCD, app *v1alpha1.Application, newImage *image.ContainerImage) error {
+func SetHelmImage(app *v1alpha1.Application, newImage *image.ContainerImage) error {
 	if appType := getApplicationType(app); appType != ApplicationTypeHelm {
 		return fmt.Errorf("cannot set Helm params on non-Helm application")
 	}
@@ -277,6 +336,15 @@ func SetHelmImage(client ArgoCD, app *v1alpha1.Application, newImage *image.Cont
 	hpImageSpec = newImage.GetParameterHelmImageSpec(app.Annotations)
 	hpImageName = newImage.GetParameterHelmImageName(app.Annotations)
 	hpImageTag = newImage.GetParameterHelmImageTag(app.Annotations)
+
+	if hpImageSpec == "" {
+		if hpImageName == "" {
+			hpImageName = common.DefaultHelmImageName
+		}
+		if hpImageTag == "" {
+			hpImageTag = common.DefaultHelmImageTag
+		}
+	}
 
 	log.WithContext().
 		AddField("application", appName).
@@ -312,17 +380,11 @@ func SetHelmImage(client ArgoCD, app *v1alpha1.Application, newImage *image.Cont
 
 	app.Spec.Source.Helm.Parameters = mergeHelmParams(app.Spec.Source.Helm.Parameters, mergeParams)
 
-	_, err := client.UpdateSpec(context.TODO(), &application.ApplicationUpdateSpecRequest{Name: &appName, Spec: app.Spec})
-	if err != nil {
-		return err
-	}
-
 	return nil
 }
 
 // SetKustomizeImage sets a Kustomize image for given application
-func SetKustomizeImage(client ArgoCD, app *v1alpha1.Application, newImage *image.ContainerImage) error {
-	appName := app.GetName()
+func SetKustomizeImage(app *v1alpha1.Application, newImage *image.ContainerImage) error {
 	if appType := getApplicationType(app); appType != ApplicationTypeKustomize {
 		return fmt.Errorf("cannot set Kustomize image on non-Kustomize application")
 	}
@@ -342,11 +404,6 @@ func SetKustomizeImage(client ArgoCD, app *v1alpha1.Application, newImage *image
 	}
 
 	app.Spec.Source.Kustomize.MergeImage(v1alpha1.KustomizeImage(ksImageParam))
-
-	_, err := client.UpdateSpec(context.TODO(), &application.ApplicationUpdateSpecRequest{Name: &appName, Spec: app.Spec})
-	if err != nil {
-		return err
-	}
 
 	return nil
 }

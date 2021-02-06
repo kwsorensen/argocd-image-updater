@@ -55,9 +55,9 @@ jobs:
       - name: Checkout code
         uses: actions/checkout@v2
       - name: Run golangci-lint
-        uses: golangci/golangci-lint-action@v1
+        uses: golangci/golangci-lint-action@v2
         with:
-          version: v1.26
+          version: v1.32
           args: --timeout 5m
   test:
     name: Ensure unit tests are passing
@@ -70,6 +70,8 @@ jobs:
         with:
           go-version: '1.14.4'
       - name: Run tests
+        env:
+          GNUPG_DISABLED: true
         run: |
           make test
       - name: Upload code coverage information to codecov.io

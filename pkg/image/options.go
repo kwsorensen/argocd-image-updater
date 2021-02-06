@@ -63,33 +63,50 @@ func (img *ContainerImage) GetParameterUpdateStrategy(annotations map[string]str
 		log.Tracef("No sort option %s found", key)
 		return VersionSortSemVer
 	}
+	log.Tracef("found update strategy %s in %s", val, key)
+	return ParseUpdateStrategy(val)
+}
+
+func ParseUpdateStrategy(val string) VersionSortMode {
 	switch strings.ToLower(val) {
 	case "semver":
-		log.Tracef("Sort option semver in %s", key)
 		return VersionSortSemVer
 	case "latest":
-		log.Tracef("Sort option date in %s", key)
 		return VersionSortLatest
 	case "name":
-		log.Tracef("Sort option name in %s", key)
 		return VersionSortName
 	default:
-		log.Warnf("Unknown sort option in %s: %s -- using semver", key, val)
+		log.Warnf("Unknown sort option %s -- using semver", val)
 		return VersionSortSemVer
 	}
+
 }
 
 // GetParameterMatch returns the match function and pattern to use for matching
 // tag names. If an invalid option is found, it returns MatchFuncNone as the
 // default, to prevent accidental matches.
 func (img *ContainerImage) GetParameterMatch(annotations map[string]string) (MatchFuncFn, interface{}) {
-	key := fmt.Sprintf(common.MatchOptionAnnotation, img.normalizedSymbolicName())
+
+	key := fmt.Sprintf(common.AllowTagsOptionAnnotation, img.normalizedSymbolicName())
 	val, ok := annotations[key]
 	if !ok {
-		log.Tracef("No match annotation %s found", key)
-		return MatchFuncAny, ""
+		// The old match-tag annotation is deprecated and will be subject to removal
+		// in a future version.
+		key = fmt.Sprintf(common.OldMatchOptionAnnotation, img.normalizedSymbolicName())
+		val, ok = annotations[key]
+		if !ok {
+			log.Tracef("No match annotation %s found", key)
+			return MatchFuncAny, ""
+		} else {
+			log.Warnf("The 'tag-match' annotation is deprecated and subject to removal. Please use 'allow-tags' annotation instead.")
+		}
 	}
 
+	return ParseMatchfunc(val)
+}
+
+// ParseMatchfunc returns a matcher function and its argument from given value
+func ParseMatchfunc(val string) (MatchFuncFn, interface{}) {
 	// The special value "any" doesn't take any parameter
 	if strings.ToLower(val) == "any" {
 		return MatchFuncAny, nil
@@ -114,6 +131,7 @@ func (img *ContainerImage) GetParameterMatch(annotations map[string]string) (Mat
 	}
 }
 
+// GetParameterPullSecret retrieves an image's pull secret credentials
 func (img *ContainerImage) GetParameterPullSecret(annotations map[string]string) *CredentialSource {
 	key := fmt.Sprintf(common.SecretListAnnotation, img.normalizedSymbolicName())
 	val, ok := annotations[key]
@@ -127,6 +145,26 @@ func (img *ContainerImage) GetParameterPullSecret(annotations map[string]string)
 		return nil
 	}
 	return credSrc
+}
+
+// GetParameterIgnoreTags retrieves a list of tags to ignore from a comma-separated string
+func (img *ContainerImage) GetParameterIgnoreTags(annotations map[string]string) []string {
+	key := fmt.Sprintf(common.IgnoreTagsOptionAnnotation, img.normalizedSymbolicName())
+	val, ok := annotations[key]
+	if !ok {
+		log.Tracef("No ignore-tags annotation %s found", key)
+		return nil
+	}
+	ignoreList := make([]string, 0)
+	tags := strings.Split(strings.TrimSpace(val), ",")
+	for _, tag := range tags {
+		// We ignore empty tags
+		trimmed := strings.TrimSpace(tag)
+		if trimmed != "" {
+			ignoreList = append(ignoreList, trimmed)
+		}
+	}
+	return ignoreList
 }
 
 func (img *ContainerImage) normalizedSymbolicName() string {

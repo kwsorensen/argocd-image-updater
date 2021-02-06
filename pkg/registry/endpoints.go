@@ -2,11 +2,15 @@ package registry
 
 import (
 	"fmt"
+	"math"
 	"strings"
 	"sync"
+	"time"
 
 	"github.com/argoproj-labs/argocd-image-updater/pkg/cache"
 	"github.com/argoproj-labs/argocd-image-updater/pkg/log"
+
+	"go.uber.org/ratelimit"
 )
 
 // TagListSort defines how the registry returns the list of tags
@@ -16,6 +20,11 @@ const (
 	SortUnsorted    TagListSort = 0
 	SortLatestFirst TagListSort = 1
 	SortLatestLast  TagListSort = 2
+)
+
+const (
+	RateLimitNone    = math.MaxInt32
+	RateLimitDefault = 10
 )
 
 // IsTimeSorted returns whether a tag list is time sorted
@@ -48,10 +57,14 @@ type RegistryEndpoint struct {
 	Password       string
 	Ping           bool
 	Credentials    string
+	Insecure       bool
+	DefaultNS      string
+	CredsExpire    time.Duration
+	CredsUpdated   time.Time
 	TagListSort    TagListSort
 	Cache          cache.ImageTagCache
-
-	lock sync.RWMutex
+	Limiter        ratelimit.Limiter
+	lock           sync.RWMutex
 }
 
 // Map of configured registries, pre-filled with some well-known registries
@@ -61,29 +74,46 @@ var defaultRegistries map[string]*RegistryEndpoint = map[string]*RegistryEndpoin
 		RegistryPrefix: "",
 		RegistryAPI:    "https://registry-1.docker.io",
 		Ping:           true,
+		Insecure:       false,
+		DefaultNS:      "library",
 		Cache:          cache.NewMemCache(),
+		Limiter:        ratelimit.New(RateLimitDefault),
 	},
 	"gcr.io": {
 		RegistryName:   "Google Container Registry",
 		RegistryPrefix: "gcr.io",
 		RegistryAPI:    "https://gcr.io",
 		Ping:           false,
+		Insecure:       false,
 		Cache:          cache.NewMemCache(),
+		Limiter:        ratelimit.New(RateLimitDefault),
 	},
 	"quay.io": {
 		RegistryName:   "RedHat Quay",
 		RegistryPrefix: "quay.io",
 		RegistryAPI:    "https://quay.io",
 		Ping:           false,
+		Insecure:       false,
 		Cache:          cache.NewMemCache(),
+		Limiter:        ratelimit.New(RateLimitDefault),
 	},
 	"docker.pkg.github.com": {
-		RegistryName:   "GitHub registry",
+		RegistryName:   "GitHub packages",
 		RegistryPrefix: "docker.pkg.github.com",
 		RegistryAPI:    "https://docker.pkg.github.com",
 		Ping:           false,
-		TagListSort:    SortLatestFirst,
+		Insecure:       false,
 		Cache:          cache.NewMemCache(),
+		Limiter:        ratelimit.New(RateLimitDefault),
+	},
+	"ghcr.io": {
+		RegistryName:   "GitHub Container Registry",
+		RegistryPrefix: "ghcr.io",
+		RegistryAPI:    "https://ghcr.io",
+		Ping:           false,
+		Insecure:       false,
+		Cache:          cache.NewMemCache(),
+		Limiter:        ratelimit.New(RateLimitDefault),
 	},
 }
 
@@ -92,16 +122,29 @@ var registries map[string]*RegistryEndpoint = make(map[string]*RegistryEndpoint)
 // Simple RW mutex for concurrent access to registries map
 var registryLock sync.RWMutex
 
+func AddRegistryEndpointFromConfig(epc RegistryConfiguration) error {
+	return AddRegistryEndpoint(epc.Prefix, epc.Name, epc.ApiURL, epc.Credentials, epc.DefaultNS, epc.Insecure, TagListSortFromString(epc.TagSortMode), epc.Limit, epc.CredsExpire)
+}
+
 // AddRegistryEndpoint adds registry endpoint information with the given details
-func AddRegistryEndpoint(prefix, name, apiUrl, credentials string) error {
+func AddRegistryEndpoint(prefix, name, apiUrl, credentials, defaultNS string, insecure bool, tagListSort TagListSort, limit int, credsExpire time.Duration) error {
 	registryLock.Lock()
 	defer registryLock.Unlock()
+	if limit <= 0 {
+		limit = RateLimitNone
+	}
+	log.Debugf("rate limit for %s is %d", apiUrl, limit)
 	registries[prefix] = &RegistryEndpoint{
 		RegistryName:   name,
 		RegistryPrefix: prefix,
 		RegistryAPI:    apiUrl,
 		Credentials:    credentials,
+		CredsExpire:    credsExpire,
 		Cache:          cache.NewMemCache(),
+		Insecure:       insecure,
+		DefaultNS:      defaultNS,
+		TagListSort:    tagListSort,
+		Limiter:        ratelimit.New(limit),
 	}
 	return nil
 }
@@ -143,6 +186,7 @@ func ConfiguredEndpoints() []string {
 
 // DeepCopy copies the endpoint to a new object, but creating a new Cache
 func (ep *RegistryEndpoint) DeepCopy() *RegistryEndpoint {
+	ep.lock.RLock()
 	newEp := &RegistryEndpoint{}
 	newEp.RegistryAPI = ep.RegistryAPI
 	newEp.RegistryName = ep.RegistryName
@@ -151,6 +195,12 @@ func (ep *RegistryEndpoint) DeepCopy() *RegistryEndpoint {
 	newEp.Ping = ep.Ping
 	newEp.TagListSort = ep.TagListSort
 	newEp.Cache = cache.NewMemCache()
+	newEp.Insecure = ep.Insecure
+	newEp.DefaultNS = ep.DefaultNS
+	newEp.Limiter = ep.Limiter
+	newEp.CredsExpire = ep.CredsExpire
+	newEp.CredsUpdated = ep.CredsUpdated
+	ep.lock.RUnlock()
 	return newEp
 }
 

@@ -11,7 +11,17 @@ rules:
       - ''
     resources:
       - secrets
+      - configmaps
     verbs:
       - get
       - list
       - watch
+  - apiGroups:
+      - argoproj.io
+    resources:
+      - applications
+    verbs:
+      - get
+      - list
+      - update
+      - patch

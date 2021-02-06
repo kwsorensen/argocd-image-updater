@@ -1,18 +1,24 @@
 package argocd
 
 import (
+	"context"
 	"fmt"
 	"testing"
 
-	"github.com/argoproj-labs/argocd-image-updater/pkg/argocd/mocks"
 	"github.com/argoproj-labs/argocd-image-updater/pkg/common"
 	"github.com/argoproj-labs/argocd-image-updater/pkg/image"
+	"github.com/argoproj-labs/argocd-image-updater/pkg/kube"
 
+	"github.com/argoproj/argo-cd/pkg/apiclient/application"
 	"github.com/argoproj/argo-cd/pkg/apis/application/v1alpha1"
+	"github.com/argoproj/argo-cd/pkg/client/clientset/versioned/fake"
 	"github.com/stretchr/testify/assert"
-	"github.com/stretchr/testify/mock"
 	"github.com/stretchr/testify/require"
+	"k8s.io/apimachinery/pkg/api/errors"
 	v1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/runtime"
+	"k8s.io/apimachinery/pkg/runtime/schema"
+	k8stesting "k8s.io/client-go/testing"
 )
 
 func Test_GetImagesFromApplication(t *testing.T) {
@@ -353,8 +359,6 @@ func Test_MergeHelmParams(t *testing.T) {
 
 func Test_SetKustomizeImage(t *testing.T) {
 	t.Run("Test set Kustomize image parameters on Kustomize app with param already set", func(t *testing.T) {
-		argocd := mocks.ArgoCD{}
-		argocd.On("UpdateSpec", mock.Anything, mock.Anything).Return(nil, nil)
 		app := &v1alpha1.Application{
 			ObjectMeta: v1.ObjectMeta{
 				Name:      "test-app",
@@ -379,7 +383,7 @@ func Test_SetKustomizeImage(t *testing.T) {
 			},
 		}
 		img := image.NewFromIdentifier("jannfis/foobar:1.0.1")
-		err := SetKustomizeImage(&argocd, app, img)
+		err := SetKustomizeImage(app, img)
 		require.NoError(t, err)
 		require.NotNil(t, app.Spec.Source.Kustomize)
 		assert.Len(t, app.Spec.Source.Kustomize.Images, 1)
@@ -387,8 +391,6 @@ func Test_SetKustomizeImage(t *testing.T) {
 	})
 
 	t.Run("Test set Kustomize image parameters on Kustomize app with no params set", func(t *testing.T) {
-		argocd := mocks.ArgoCD{}
-		argocd.On("UpdateSpec", mock.Anything, mock.Anything).Return(nil, nil)
 		app := &v1alpha1.Application{
 			ObjectMeta: v1.ObjectMeta{
 				Name:      "test-app",
@@ -407,7 +409,7 @@ func Test_SetKustomizeImage(t *testing.T) {
 			},
 		}
 		img := image.NewFromIdentifier("jannfis/foobar:1.0.1")
-		err := SetKustomizeImage(&argocd, app, img)
+		err := SetKustomizeImage(app, img)
 		require.NoError(t, err)
 		require.NotNil(t, app.Spec.Source.Kustomize)
 		assert.Len(t, app.Spec.Source.Kustomize.Images, 1)
@@ -415,8 +417,6 @@ func Test_SetKustomizeImage(t *testing.T) {
 	})
 
 	t.Run("Test set Kustomize image parameters on non-Kustomize app", func(t *testing.T) {
-		argocd := mocks.ArgoCD{}
-		argocd.On("UpdateSpec", mock.Anything, mock.Anything).Return(nil, nil)
 		app := &v1alpha1.Application{
 			ObjectMeta: v1.ObjectMeta{
 				Name:      "test-app",
@@ -441,7 +441,7 @@ func Test_SetKustomizeImage(t *testing.T) {
 			},
 		}
 		img := image.NewFromIdentifier("jannfis/foobar:1.0.1")
-		err := SetKustomizeImage(&argocd, app, img)
+		err := SetKustomizeImage(app, img)
 		require.Error(t, err)
 	})
 
@@ -449,8 +449,6 @@ func Test_SetKustomizeImage(t *testing.T) {
 
 func Test_SetHelmImage(t *testing.T) {
 	t.Run("Test set Helm image parameters on Helm app with existing parameters", func(t *testing.T) {
-		argocd := mocks.ArgoCD{}
-		argocd.On("UpdateSpec", mock.Anything, mock.Anything).Return(nil, nil)
 		app := &v1alpha1.Application{
 			ObjectMeta: v1.ObjectMeta{
 				Name:      "test-app",
@@ -488,7 +486,7 @@ func Test_SetHelmImage(t *testing.T) {
 
 		img := image.NewFromIdentifier("foobar=jannfis/foobar:1.0.1")
 
-		err := SetHelmImage(&argocd, app, img)
+		err := SetHelmImage(app, img)
 		require.NoError(t, err)
 		require.NotNil(t, app.Spec.Source.Helm)
 		assert.Len(t, app.Spec.Source.Helm.Parameters, 2)
@@ -505,8 +503,6 @@ func Test_SetHelmImage(t *testing.T) {
 	})
 
 	t.Run("Test set Helm image parameters on Helm app without existing parameters", func(t *testing.T) {
-		argocd := mocks.ArgoCD{}
-		argocd.On("UpdateSpec", mock.Anything, mock.Anything).Return(nil, nil)
 		app := &v1alpha1.Application{
 			ObjectMeta: v1.ObjectMeta{
 				Name:      "test-app",
@@ -533,7 +529,7 @@ func Test_SetHelmImage(t *testing.T) {
 
 		img := image.NewFromIdentifier("foobar=jannfis/foobar:1.0.1")
 
-		err := SetHelmImage(&argocd, app, img)
+		err := SetHelmImage(app, img)
 		require.NoError(t, err)
 		require.NotNil(t, app.Spec.Source.Helm)
 		assert.Len(t, app.Spec.Source.Helm.Parameters, 2)
@@ -550,8 +546,6 @@ func Test_SetHelmImage(t *testing.T) {
 	})
 
 	t.Run("Test set Helm image parameters on Helm app with different parameters", func(t *testing.T) {
-		argocd := mocks.ArgoCD{}
-		argocd.On("UpdateSpec", mock.Anything, mock.Anything).Return(nil, nil)
 		app := &v1alpha1.Application{
 			ObjectMeta: v1.ObjectMeta{
 				Name:      "test-app",
@@ -589,7 +583,7 @@ func Test_SetHelmImage(t *testing.T) {
 
 		img := image.NewFromIdentifier("foobar=jannfis/foobar:1.0.1")
 
-		err := SetHelmImage(&argocd, app, img)
+		err := SetHelmImage(app, img)
 		require.NoError(t, err)
 		require.NotNil(t, app.Spec.Source.Helm)
 		assert.Len(t, app.Spec.Source.Helm.Parameters, 4)
@@ -606,8 +600,6 @@ func Test_SetHelmImage(t *testing.T) {
 	})
 
 	t.Run("Test set Helm image parameters on non Helm app", func(t *testing.T) {
-		argocd := mocks.ArgoCD{}
-		argocd.On("UpdateSpec", mock.Anything, mock.Anything).Return(nil, nil)
 		app := &v1alpha1.Application{
 			ObjectMeta: v1.ObjectMeta{
 				Name:      "test-app",
@@ -632,8 +624,81 @@ func Test_SetHelmImage(t *testing.T) {
 
 		img := image.NewFromIdentifier("foobar=jannfis/foobar:1.0.1")
 
-		err := SetHelmImage(&argocd, app, img)
+		err := SetHelmImage(app, img)
 		require.Error(t, err)
 	})
 
+}
+
+func TestKubernetesClient(t *testing.T) {
+	app1 := &v1alpha1.Application{
+		ObjectMeta: v1.ObjectMeta{Name: "test-app1", Namespace: "testns1"},
+	}
+	app2 := &v1alpha1.Application{
+		ObjectMeta: v1.ObjectMeta{Name: "test-app2", Namespace: "testns2"},
+	}
+
+	client, err := NewK8SClient(&kube.KubernetesClient{
+		Namespace:             "testns1",
+		ApplicationsClientset: fake.NewSimpleClientset(app1, app2),
+	})
+
+	require.NoError(t, err)
+
+	t.Run("List applications", func(t *testing.T) {
+		apps, err := client.ListApplications()
+		require.NoError(t, err)
+		require.Len(t, apps, 1)
+
+		assert.ElementsMatch(t, []string{"test-app1"}, []string{app1.Name})
+	})
+
+	t.Run("Get application successful", func(t *testing.T) {
+		app, err := client.GetApplication(context.TODO(), "test-app1")
+		require.NoError(t, err)
+		assert.Equal(t, "test-app1", app.GetName())
+	})
+
+	t.Run("Get application not found", func(t *testing.T) {
+		_, err := client.GetApplication(context.TODO(), "test-app2")
+		require.Error(t, err)
+		assert.True(t, errors.IsNotFound(err))
+	})
+}
+
+func TestKubernetesClient_UpdateSpec_Conflict(t *testing.T) {
+	app := &v1alpha1.Application{
+		ObjectMeta: v1.ObjectMeta{Name: "test-app", Namespace: "testns"},
+	}
+	clientset := fake.NewSimpleClientset(app)
+
+	attempts := 0
+	clientset.PrependReactor("update", "*", func(action k8stesting.Action) (handled bool, ret runtime.Object, err error) {
+		if attempts == 0 {
+			attempts++
+			return true, nil, errors.NewConflict(
+				schema.GroupResource{Group: "argoproj.io", Resource: "Application"}, app.Name, fmt.Errorf("conflict updating %s", app.Name))
+		} else {
+			return false, nil, nil
+		}
+	})
+
+	client, err := NewK8SClient(&kube.KubernetesClient{
+		Namespace:             "testns",
+		ApplicationsClientset: clientset,
+	})
+	require.NoError(t, err)
+
+	appName := "test-app"
+
+	spec, err := client.UpdateSpec(context.TODO(), &application.ApplicationUpdateSpecRequest{
+		Name: &appName,
+		Spec: v1alpha1.ApplicationSpec{Source: v1alpha1.ApplicationSource{
+			RepoURL: "https://github.com/argoproj/argocd-example-apps",
+		}},
+	})
+
+	require.NoError(t, err)
+
+	assert.Equal(t, "https://github.com/argoproj/argocd-example-apps", spec.Source.RepoURL)
 }

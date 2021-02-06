@@ -5,9 +5,13 @@ import (
 	"encoding/json"
 	"fmt"
 	"os"
+	"os/exec"
 	"strings"
+	"time"
 
-	"github.com/argoproj-labs/argocd-image-updater/pkg/client"
+	argoexec "github.com/argoproj/pkg/exec"
+
+	"github.com/argoproj-labs/argocd-image-updater/pkg/kube"
 	"github.com/argoproj-labs/argocd-image-updater/pkg/log"
 )
 
@@ -18,6 +22,7 @@ const (
 	CredentialSourcePullSecret CredentialSourceType = 1
 	CredentialSourceSecret     CredentialSourceType = 2
 	CredentialSourceEnv        CredentialSourceType = 3
+	CredentialSourceExt        CredentialSourceType = 4
 )
 
 type CredentialSource struct {
@@ -27,6 +32,7 @@ type CredentialSource struct {
 	SecretName      string
 	SecretField     string
 	EnvName         string
+	ScriptPath      string
 }
 
 type Credential struct {
@@ -70,6 +76,9 @@ func ParseCredentialSource(credentialSource string, requirePrefix bool) (*Creden
 	case "env":
 		err = src.parseEnvDefinition(tokens[1])
 		src.Type = CredentialSourceEnv
+	case "ext":
+		err = src.parseExtDefinition(tokens[1])
+		src.Type = CredentialSourceExt
 	default:
 		err = fmt.Errorf("unknown credential source: %s", tokens[0])
 	}
@@ -83,7 +92,7 @@ func ParseCredentialSource(credentialSource string, requirePrefix bool) (*Creden
 
 // FetchCredentials fetches the credentials for a given registry according to
 // the credential source.
-func (src *CredentialSource) FetchCredentials(registryURL string, kubeclient *client.KubernetesClient) (*Credential, error) {
+func (src *CredentialSource) FetchCredentials(registryURL string, kubeclient *kube.KubernetesClient) (*Credential, error) {
 	var creds Credential
 	switch src.Type {
 	case CredentialSourceEnv:
@@ -99,6 +108,9 @@ func (src *CredentialSource) FetchCredentials(registryURL string, kubeclient *cl
 		creds.Password = tokens[1]
 		return &creds, nil
 	case CredentialSourceSecret:
+		if kubeclient == nil {
+			return nil, fmt.Errorf("could not fetch credentials: no Kubernetes client given")
+		}
 		data, err := kubeclient.GetSecretField(src.SecretNamespace, src.SecretName, src.SecretField)
 		if err != nil {
 			return nil, fmt.Errorf("could not fetch secret '%s' from namespace '%s' (field: '%s'): %v", src.SecretName, src.SecretNamespace, src.SecretField, err)
@@ -111,6 +123,9 @@ func (src *CredentialSource) FetchCredentials(registryURL string, kubeclient *cl
 		creds.Password = tokens[1]
 		return &creds, nil
 	case CredentialSourcePullSecret:
+		if kubeclient == nil {
+			return nil, fmt.Errorf("could not fetch credentials: no Kubernetes client given")
+		}
 		src.SecretField = pullSecretField
 		data, err := kubeclient.GetSecretField(src.SecretNamespace, src.SecretName, src.SecretField)
 		if err != nil {
@@ -121,6 +136,27 @@ func (src *CredentialSource) FetchCredentials(registryURL string, kubeclient *cl
 			return nil, err
 		}
 		return &creds, nil
+	case CredentialSourceExt:
+		if !strings.HasPrefix(src.ScriptPath, "/") {
+			return nil, fmt.Errorf("path to script must be absolute, but is '%s'", src.ScriptPath)
+		}
+		_, err := os.Stat(src.ScriptPath)
+		if err != nil {
+			return nil, fmt.Errorf("could not stat %s: %v", src.ScriptPath, err)
+		}
+		cmd := exec.Command(src.ScriptPath)
+		out, err := argoexec.RunCommandExt(cmd, argoexec.CmdOpts{Timeout: 10 * time.Second})
+		if err != nil {
+			return nil, fmt.Errorf("error executing %s: %v", src.ScriptPath, err)
+		}
+		tokens := strings.SplitN(out, ":", 2)
+		if len(tokens) != 2 {
+			return nil, fmt.Errorf("invalid script output, must be single line with syntax <username>:<password>")
+		}
+		creds.Username = tokens[0]
+		creds.Password = tokens[1]
+		return &creds, nil
+
 	default:
 		return nil, fmt.Errorf("unknown credential type")
 	}
@@ -164,6 +200,13 @@ func (src *CredentialSource) parseEnvDefinition(definition string) error {
 	return nil
 }
 
+// Parse an external script definition
+// nolint:unparam
+func (src *CredentialSource) parseExtDefinition(definition string) error {
+	src.ScriptPath = definition
+	return nil
+}
+
 // This unmarshals & parses Docker's config.json file, returning username and
 // password for given registry URL
 func parseDockerConfigJson(registryURL string, jsonSource string) (string, string, error) {
@@ -177,8 +220,17 @@ func parseDockerConfigJson(registryURL string, jsonSource string) (string, strin
 		return "", "", fmt.Errorf("no credentials in image pull secret")
 	}
 
+	var regPrefix string
+	if strings.HasPrefix(registryURL, "http://") {
+		regPrefix = strings.TrimPrefix(registryURL, "http://")
+	} else if strings.HasPrefix(registryURL, "https://") {
+		regPrefix = strings.TrimPrefix(registryURL, "https://")
+	} else {
+		regPrefix = registryURL
+	}
+
 	for registry, authConf := range auths {
-		if !strings.HasPrefix(registry, registryURL) {
+		if !strings.HasPrefix(registry, registryURL) && !strings.HasPrefix(registry, regPrefix) {
 			log.Tracef("found registry %s in image pull secret, but we want %s - skipping", registry, registryURL)
 			continue
 		}

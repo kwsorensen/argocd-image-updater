@@ -1,5 +1,16 @@
 ^\.github/
 ^go\.(?:sum|mod)$
 \/mocks\/
+^ext/
+^hack\/
 ignore$
 \.png$
+^\.config/
+\.json$
+\.yaml$
+\.go$
+\.css$
+\.js$
+\.yml$
+\.yaml$
+Dockerfile

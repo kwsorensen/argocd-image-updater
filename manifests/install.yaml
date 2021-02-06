@@ -20,10 +20,20 @@ rules:
   - ""
   resources:
   - secrets
+  - configmaps
   verbs:
   - get
   - list
   - watch
+- apiGroups:
+  - argoproj.io
+  resources:
+  - applications
+  verbs:
+  - get
+  - list
+  - update
+  - patch
 ---
 apiVersion: rbac.authorization.k8s.io/v1
 kind: RoleBinding
@@ -79,6 +89,12 @@ spec:
         - /usr/local/bin/argocd-image-updater
         - run
         env:
+        - name: APPLICATIONS_API
+          valueFrom:
+            configMapKeyRef:
+              key: applications_api
+              name: argocd-image-updater-config
+              optional: true
         - name: ARGOCD_GRPC_WEB
           valueFrom:
             configMapKeyRef:
@@ -109,6 +125,24 @@ spec:
               key: argocd.token
               name: argocd-image-updater-secret
               optional: true
+        - name: IMAGE_UPDATER_LOGLEVEL
+          valueFrom:
+            configMapKeyRef:
+              key: log.level
+              name: argocd-image-updater-config
+              optional: true
+        - name: GIT_COMMIT_USER
+          valueFrom:
+            configMapKeyRef:
+              key: git.user
+              name: argocd-image-updater-config
+              optional: true
+        - name: GIT_COMMIT_EMAIL
+          valueFrom:
+            configMapKeyRef:
+              key: git.email
+              name: argocd-image-updater-config
+              optional: true
         image: argoprojlabs/argocd-image-updater:latest
         imagePullPolicy: Always
         livenessProbe:
@@ -136,4 +170,5 @@ spec:
           - key: registries.conf
             path: registries.conf
           name: argocd-image-updater-config
+          optional: true
         name: registries-conf

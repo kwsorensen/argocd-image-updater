@@ -8,6 +8,12 @@ const ImageUpdaterAnnotationPrefix = "argocd-image-updater.argoproj.io"
 // allowed for updates.
 const ImageUpdaterAnnotation = ImageUpdaterAnnotationPrefix + "/image-list"
 
+// Defaults for Helm parameter names
+const (
+	DefaultHelmImageName = "image.name"
+	DefaultHelmImageTag  = "image.tag"
+)
+
 // Helm related annotations
 const (
 	HelmParamImageNameAnnotation = ImageUpdaterAnnotationPrefix + "/%s.helm.image-name"
@@ -22,11 +28,19 @@ const (
 
 // Upgrade strategy related annotations
 const (
-	MatchOptionAnnotation    = ImageUpdaterAnnotationPrefix + "/%s.tag-match"
-	UpdateStrategyAnnotation = ImageUpdaterAnnotationPrefix + "/%s.update-strategy"
+	OldMatchOptionAnnotation   = ImageUpdaterAnnotationPrefix + "/%s.tag-match" // Deprecated and will be removed
+	AllowTagsOptionAnnotation  = ImageUpdaterAnnotationPrefix + "/%s.allow-tags"
+	IgnoreTagsOptionAnnotation = ImageUpdaterAnnotationPrefix + "/%s.ignore-tags"
+	UpdateStrategyAnnotation   = ImageUpdaterAnnotationPrefix + "/%s.update-strategy"
 )
 
 // Image pull secret related annotations
 const (
 	SecretListAnnotation = ImageUpdaterAnnotationPrefix + "/%s.pull-secret"
+)
+
+// Application update configuration related annotations
+const (
+	WriteBackMethodAnnotation = ImageUpdaterAnnotationPrefix + "/write-back-method"
+	GitBranchAnnotation       = ImageUpdaterAnnotationPrefix + "/git-branch"
 )
